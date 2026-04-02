@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Minerva Archive CDN Torrent Sizes
 // @namespace    http://tampermonkey.net/
-// @version      4.0
-// @description  Fetches and parses .torrent files to show content sizes as badges.To sort by file size, click the sort header at the top of the list! https://discord.gg/minerva-archive
+// @version      4.1
+// @description  Fetches and parses .torrent files to show content sizes in the Size column as badges. Click the Size header to sort by computed size. https://discord.gg/minerva-archive
 // @author       Pixel has heavily modified the script to now use actual file sizes instead of from a json file. Old script from user melumiii on the MiNERVA Discord.
 // @match        https://cdn.minerva-archive.org/*
 // @grant        none
@@ -14,6 +14,9 @@
     const CACHE_PREFIX = 'minerva_v4_';
     const CONCURRENCY  = 5;
     const BADGE_WIDTH  = '85px';
+
+    // DO NOT show size in the Name column
+    const SHOW_SIZE_IN_NAME = false;
 
     // Catppuccin Frappe theme::
     function getBadgeColor(bytes) {
@@ -117,10 +120,13 @@
         const torrent = bdecode(new Uint8Array(buffer), { pos: 0 });
         const info = torrent?.info;
         if (!info) return -1;
+
         if (info.length !== undefined) return Number(info.length);
+
         if (Array.isArray(info.files)) {
             return Number(info.files.reduce((sum, f) => sum + (f.length !== undefined ? BigInt(f.length) : 0n), 0n));
         }
+
         return -1;
     }
 
@@ -153,37 +159,125 @@
         }
     }
 
+  // set Size column size
+    function setSizeColumnWidth(px = 110) {
+      const style = document.createElement('style');
+      style.textContent = `
+          /* Column Size (th + td) */
+          #indexlist th.indexcolsize,
+          #indexlist td.indexcolsize {
+              width: ${px}px !important;
+              max-width: ${px}px !important;
+              min-width: ${px}px !important;
+              white-space: nowrap !important;
+          }
+
+          #indexlist td.indexcolsize {
+              text-align: center !important;
+          }
+      `;
+      document.head.appendChild(style);
+    }
+    // Badge INSIDE the Size column (td.indexcolsize)
     function applyBadge(a, tr, bytes, readable) {
-        a.previousElementSibling?.classList.contains('tm-size-badge') && a.previousElementSibling.remove();
         tr.dataset.sizeBytes = bytes;
+
+        const sizeTd = tr.querySelector('td.indexcolsize');
+        if (!sizeTd) return;
+
+        sizeTd.querySelector('.tm-size-badge')?.remove();
+
         const badge = document.createElement('span');
         badge.className = 'tm-size-badge';
         const bg = getBadgeColor(bytes);
         const darkBg = bg === '#737994';
+
         badge.style.cssText = `
             display: inline-block; width: ${BADGE_WIDTH}; text-align: center;
             background-color: ${bg}; color: ${darkBg ? '#c6d0f5' : '#303446'};
             font-size: 0.85em; font-weight: bold; padding: 3px 0;
-            border-radius: 12px; margin-right: 12px;
+            border-radius: 12px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.3);
             vertical-align: middle; box-sizing: border-box;
         `;
         badge.textContent = readable;
-        a.style.verticalAlign = 'middle';
-        a.parentNode.insertBefore(badge, a);
+
+        sizeTd.textContent = '';
+        sizeTd.appendChild(badge);
     }
 
+    // kept for compatibility; no-op when SHOW_SIZE_IN_NAME is false
+    function prefixNameWithSize(a, readable) {
+        if (!SHOW_SIZE_IN_NAME) return;
+        if (!a) return;
+
+        // remove existing prefix then apply ours
+        const current = a.textContent ?? '';
+        const stripped = current.replace(/^\(\s*[\d.,]+\s*(?:B|KB|MB|GB|TB|PB)\s*\)\s*/i, '');
+        if (readable && readable !== '...' && readable !== 'N/A' && readable !== 'ERR') {
+            a.textContent = `(${readable}) ${stripped}`;
+        } else {
+            a.textContent = stripped;
+        }
+    }
+
+    function getTable() {
+        const table = document.querySelector('#indexlist');
+        if (!table) return null;
+        const thead = table.querySelector('thead');
+        const tbody = table.querySelector('tbody') ?? table;
+        return { table, thead, tbody };
+    }
+
+    function findSizeColumnIndex() {
+        const headerRow = document.querySelector('#indexlist thead tr') || document.querySelector('#indexlist tr');
+        if (!headerRow) return -1;
+        const ths = Array.from(headerRow.querySelectorAll('th'));
+
+        let idx = ths.findIndex(th => th.classList.contains('indexcolsize'));
+        if (idx !== -1) return idx;
+
+        idx = ths.findIndex(th => th.textContent.trim().toLowerCase() === 'size');
+        return idx;
+    }
+
+    function moveColumnToFirst(colIndex) {
+        if (colIndex <= 0) return;
+        const t = getTable();
+        if (!t?.tbody) return;
+
+        if (t.thead) {
+            for (const tr of t.thead.querySelectorAll('tr')) {
+                const cells = tr.children;
+                if (!cells || !cells[colIndex]) continue;
+                tr.insertBefore(cells[colIndex], cells[0]);
+            }
+        }
+
+        for (const tr of t.tbody.querySelectorAll('tr')) {
+            const cells = tr.children;
+            if (!cells || !cells[colIndex]) continue;
+            tr.insertBefore(cells[colIndex], cells[0]);
+        }
+    }
+
+    // Sorting by computed bytes on Size header click
     let currentSort = null;
 
     function hookSizeHeader() {
         const sizeHeader = document.querySelector('th.indexcolsize a');
         if (!sizeHeader) return;
+
         sizeHeader.addEventListener('click', (e) => {
             e.preventDefault();
+
             const table = document.querySelector('#indexlist');
             if (!table) return;
             const tbody = table.querySelector('tbody') ?? table;
-            const rows = Array.from(tbody.querySelectorAll('tr')).filter(r => r.querySelector('td.indexcolname'));
+
+            const rows = Array.from(tbody.querySelectorAll('tr'))
+                .filter(r => r.querySelector('td.indexcolname'));
+
             if (currentSort !== 'desc') {
                 currentSort = 'desc';
                 rows.sort((a, b) => Number(b.dataset.sizeBytes ?? -1) - Number(a.dataset.sizeBytes ?? -1));
@@ -197,6 +291,7 @@
                     return sA - sB;
                 });
             }
+
             rows.forEach(row => tbody.appendChild(row));
             rows.forEach((row, i) => { row.className = i % 2 === 0 ? 'even' : 'odd'; });
         });
@@ -209,23 +304,36 @@
     }
 
     async function init() {
+        setSizeColumnWidth(90);
         const links = Array.from(document.querySelectorAll('td.indexcolname a'))
             .filter(a => a.textContent.trim().endsWith('.torrent'));
         if (!links.length) return;
 
+        // Ensure Size column is first
+        const sizeColIdx = findSizeColumnIndex();
+        if (sizeColIdx !== -1) moveColumnToFirst(sizeColIdx);
+
         hookSizeHeader();
 
+        // First pass: show cached values immediately
         for (const a of links) {
-            const cached = cacheGet(decodeURIComponent(a.href.split('/').pop()));
+            const filename = decodeURIComponent(a.href.split('/').pop());
+            const cached = cacheGet(filename);
             const tr = a.closest('tr');
-            if (tr) applyBadge(a, tr, cached?.bytes ?? -1, cached?.readable ?? '...');
+            if (!tr) continue;
+
+            applyBadge(a, tr, cached?.bytes ?? -1, cached?.readable ?? '...');
+            // prefixNameWithSize disabled by SHOW_SIZE_IN_NAME=false
+            prefixNameWithSize(a, cached?.readable ?? '...');
         }
 
+        // Second pass: compute/fetch and update
         await processQueue(links, CONCURRENCY, async (a) => {
             const tr = a.closest('tr');
             if (!tr) return;
             const { bytes, readable } = await getSizeForTorrent(a.href);
             applyBadge(a, tr, bytes, readable);
+            prefixNameWithSize(a, readable);
         });
 
         console.log(`[Minerva Sizes] ${links.length} torrents sized.`);
